@@ -35,13 +35,18 @@ PROXY_PORT = 8668
 PROXY_USER = "user-K7UO7Ach_6607-region-de-city-TROISDORF-sess-838010-sessTime-118"
 PROXY_PASS = "wB20uBAH"
 
-# ساخت هدر اعتبارسنجی پروکسی
 _auth_bytes = f"{PROXY_USER}:{PROXY_PASS}".encode("utf-8")
 _auth_b64 = base64.b64encode(_auth_bytes).decode("utf-8")
 
+# ذخیره تابع اصلی asyncio برای استفاده درون پچ
+_original_open_connection = asyncio.open_connection
+
 async def _patched_open_connection(host, port, *args, **kwargs):
-    """جایگزین کردن تابع استاندارد اتصال پایتون جهت اجبار به استفاده از پروکسی"""
-    reader, writer = await asyncio.open_connection_host_port(PROXY_HOST, PROXY_PORT, *args, **kwargs)
+    """اتصال به مقصد از طریق متد HTTP CONNECT پروکسی به صورت کاملاً استاندارد"""
+    # ابتدا به سرور پروکسی وصل می‌شویم
+    reader, writer = await _original_open_connection(PROXY_HOST, PROXY_PORT, *args, **kwargs)
+    
+    # ارسال هدر CONNECT به پروکسی
     connect_req = (
         f"CONNECT {host}:{port} HTTP/1.1\r\n"
         f"Host: {host}:{port}\r\n"
@@ -51,21 +56,22 @@ async def _patched_open_connection(host, port, *args, **kwargs):
     writer.write(connect_req.encode("utf-8"))
     await writer.drain()
     
+    # دریافت پاسخ از پروکسی
     resp_line = await reader.readline()
     if b"200" not in resp_line:
         writer.close()
         await writer.wait_closed()
         raise ConnectionError(f"Proxy rejected: {resp_line.decode().strip()}")
         
+    # خواندن هدرهای اضافه تا رسیدن به خط خالی
     while True:
         line = await reader.readline()
         if line == b"\r\n" or not line:
             break
+            
     return reader, writer
 
-# اعمال پچ روی متد اتصال اصلی اسینسیو پایتون
-if not hasattr(asyncio, "open_connection_host_port"):
-    asyncio.open_connection_host_port = asyncio.open_connection
+# جایگزین کردن تابع پچ شده در هسته اصلی اسینسیو پایتون
 asyncio.open_connection = _patched_open_connection
 # ──────────────────────────────────────────────────────────────────────────────
 
