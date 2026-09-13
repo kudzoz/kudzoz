@@ -1,10 +1,10 @@
 # relay_vless.py
-# بخش VLESS Relay — جدا شده از main.py (منطق اصلی دست‌نخورده)
-# تغییر: ثبت IP واقعی کلاینت (با احتساب هدر x-forwarded-for پشت پراکسی) در connections
-# تغییر جدید: هدایت ترافیک خروجی از طریق پروکسی مسکونی دویچه تلکام آلمان (Socks5)
+# بخش VLESS Relay — جدا شده از main.py
+# تغییر نهایی: روت کردن ترافیک خروجی با پروتکل HTTP Proxy با احراز هویت اختصاصی
 
 import asyncio
 import secrets
+import base64
 from datetime import datetime
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -26,12 +26,11 @@ from main import (
 from speed_limit import throttle
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VLESS Relay — بهینه‌شده برای حداکثر throughput
+# VLESS Relay
 # ══════════════════════════════════════════════════════════════════════════════
 
 RELAY_BUF = 256 * 1024   # 256 KB buffer
 
-# مشخصات پروکسی مسکونی دویچه تلکام شما
 PROXY_HOST = "://ipoasis.com"
 PROXY_PORT = 8668
 PROXY_USER = "user-K7UO7Ach_6607-region-de-city-TROISDORF-sess-838010-sessTime-118"
@@ -79,65 +78,38 @@ async def check_and_use(uid: str, n: int) -> bool:
         hourly_traffic[now_ir().strftime("%H:00")] += n
     return True
 
-async def open_socks5_connection(target_host: str, target_port: int) -> tuple:
-    """باز کردن اتصال به مقصد نهایی از طریق پروکسی ساکس ۵ با احراز هویت"""
+async def open_http_proxy_connection(target_host: str, target_port: int) -> tuple:
+    """اتصال به مقصد از طریق متد HTTP CONNECT با احراز هویت بیسیک"""
     reader, writer = await asyncio.open_connection(PROXY_HOST, PROXY_PORT)
     
-    # مرحله 1: ارسال متدهای احراز هویت (تأیید متد یوزرنیم/پسورد)
-    writer.write(b"\x05\x02\x00\x02")
+    # ساخت هدر احراز هویت پروکسی
+    auth_str = f"{PROXY_USER}:{PROXY_PASS}"
+    auth_b64 = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
+    
+    # ارسال درخواست تونل به پروکسی
+    connect_req = (
+        f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+        f"Host: {target_host}:{target_port}\r\n"
+        f"Proxy-Authorization: Basic {auth_b64}\r\n"
+        f"Proxy-Connection: Keep-Alive\r\n\r\n"
+    )
+    
+    writer.write(connect_req.encode('utf-8'))
     await writer.drain()
     
-    version, method = await reader.readexactly(2)
-    if version != 5:
-        raise ValueError("نسخه پروتکل ساکس نامعتبر است")
+    # خواندن پاسخ اولیه پروکسی
+    response_line = await reader.readline()
+    if b"200" not in response_line:
+        writer.close()
+        await writer.wait_closed()
+        raise ValueError(f"پروکسی درخواست اتصال را رد کرد: {response_line.decode().strip()}")
         
-    if method == 2:
-        # مرحله 2: انجام احراز هویت با نام کاربری و رمز عبور
-        user_bytes = PROXY_USER.encode('utf-8')
-        pass_bytes = PROXY_PASS.encode('utf-8')
-        auth_req = b"\x01" + bytes([len(user_bytes)]) + user_bytes + bytes([len(pass_bytes)]) + pass_bytes
-        writer.write(auth_req)
-        await writer.drain()
-        
-        auth_ver, auth_status = await reader.readexactly(2)
-        if auth_status != 0:
-            raise ValueError("نام کاربری یا رمز عبور پروکسی اشتباه است")
-    elif method != 0:
-        raise ValueError("پروکسی متد احراز هویت پشتیبانی شده را قبول نکرد")
-
-    # مرحله 3: ارسال درخواست کانکت به مقصد اصلی
-    req = b"\x05\x01\x00"
-    try:
-        # بررسی اینکه مقصد آی‌پی است یا دامنه
-        import ipaddress
-        ip_obj = ipaddress.ip_address(target_host)
-        if ip_obj.version == 4:
-            req += b"\x01" + ip_obj.packed
-        else:
-            req += b"\x04" + ip_obj.packed
-    except ValueError:
-        # اگر دامنه بود
-        host_bytes = target_host.encode('utf-8')
-        req += b"\x03" + bytes([len(host_bytes)]) + host_bytes
-        
-    req += target_port.to_bytes(2, 'big')
-    writer.write(req)
-    await writer.drain()
-    
-    # خواندن پاسخ سرور پروکسی
-    resp = await reader.readexactly(4)
-    if resp[1] != 0:
-        raise ValueError(f"اتصال پروکسی ناموفق بود با کد خطا: {resp[1]}")
-        
-    if resp[3] == 1:
-        await reader.readexactly(4)
-    elif resp[3] == 4:
-        await reader.readexactly(16)
-    elif resp[3] == 3:
-        dlen = await reader.readexactly(1)
-        await reader.readexactly(dlen[0])
-        
-    await reader.readexactly(2) # خواندن پورت باز شده در پاسخ
+    # خالی کردن سایر هدرهای پاسخ پروکسی تا رسیدن به خط خالی نهایی
+    while True:
+        line = await reader.readline()
+        if line == b"\r\n" or not line:
+            break
+            
     return reader, writer
 
 async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, uid: str):
@@ -231,11 +203,11 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
 
         stats["total_requests"] += 1
         connections[conn_id]["bytes"] += len(first_chunk)
-        logger.info(f"➡️  [{conn_id}] → {address}:{port} (Via Telekom Proxy)")
+        logger.info(f"➡️  [{conn_id}] → {address}:{port} (Via HTTP Proxy)")
 
-        # تغییر کلیدی: اتصال از طریق تابع جدید پروکسی ساکس ۵
+        # استفاده از تابع اتصال پروکسی HTTP
         reader, writer = await asyncio.wait_for(
-            open_socks5_connection(address, port),
+            open_http_proxy_connection(address, port),
             timeout=12.0
         )
         sock = writer.transport.get_extra_info('socket')
@@ -267,7 +239,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         pass
     except asyncio.TimeoutError:
         stats["total_errors"] += 1
-        error_logs.append({"error": "connection timeout via proxy", "time": datetime.now().isoformat()})
+        error_logs.append({"error": "connection timeout via http proxy", "time": datetime.now().isoformat()})
     except Exception as exc:
         stats["total_errors"] += 1
         error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
