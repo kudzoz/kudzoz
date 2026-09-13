@@ -234,4 +234,3 @@ SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 LOGIN_FAILURES: dict[str, list[float]] = defaultdict(list)
 LOGIN_LOCK = asyncio.Lock()
-
