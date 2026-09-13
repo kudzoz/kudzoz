@@ -38,15 +38,12 @@ PROXY_PASS = "wB20uBAH"
 _auth_bytes = f"{PROXY_USER}:{PROXY_PASS}".encode("utf-8")
 _auth_b64 = base64.b64encode(_auth_bytes).decode("utf-8")
 
-# ذخیره تابع اصلی asyncio برای استفاده درون پچ
 _original_open_connection = asyncio.open_connection
 
 async def _patched_open_connection(host, port, *args, **kwargs):
-    """اتصال به مقصد از طریق متد HTTP CONNECT پروکسی به صورت کاملاً استاندارد"""
-    # ابتدا به سرور پروکسی وصل می‌شویم
+    """اتصال به مقصد از طریق متد CONNECT پروکسی"""
     reader, writer = await _original_open_connection(PROXY_HOST, PROXY_PORT, *args, **kwargs)
     
-    # ارسال هدر CONNECT به پروکسی
     connect_req = (
         f"CONNECT {host}:{port} HTTP/1.1\r\n"
         f"Host: {host}:{port}\r\n"
@@ -56,14 +53,12 @@ async def _patched_open_connection(host, port, *args, **kwargs):
     writer.write(connect_req.encode("utf-8"))
     await writer.drain()
     
-    # دریافت پاسخ از پروکسی
     resp_line = await reader.readline()
     if b"200" not in resp_line:
         writer.close()
         await writer.wait_closed()
         raise ConnectionError(f"Proxy rejected: {resp_line.decode().strip()}")
         
-    # خواندن هدرهای اضافه تا رسیدن به خط خالی
     while True:
         line = await reader.readline()
         if line == b"\r\n" or not line:
@@ -71,11 +66,9 @@ async def _patched_open_connection(host, port, *args, **kwargs):
             
     return reader, writer
 
-# جایگزین کردن تابع پچ شده در هسته اصلی اسینسیو پایتون
 asyncio.open_connection = _patched_open_connection
 # ──────────────────────────────────────────────────────────────────────────────
 
-# When launched as `python main.py`, relay modules import `main`; alias the running module first.
 if __name__ == "__main__":
     sys.modules.setdefault("main", sys.modules[__name__])
 
@@ -109,7 +102,7 @@ def _load_or_create_secret() -> str:
         SECRET_FILE.write_text(new_secret, encoding="utf-8")
         return new_secret
     except Exception as e:
-        logger.warning(f"Could not persist SECRET_KEY, sessions/password may reset on restart: {e}")
+        logger.warning(f"Could not persist SECRET_KEY: {e}")
         return secrets.token_urlsafe(32)
 
 CONFIG = {
@@ -118,6 +111,8 @@ CONFIG = {
     "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
 }
 TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "false").lower() in {"1", "true", "yes"}
+
+# رفع کامل ارور اصلی کدهای پنل
 ALLOWED_PUBLIC_HOSTS = {x.strip().split(":", 1)[0].lower() for x in os.environ.get("ALLOWED_PUBLIC_HOSTS", "").split(",") if x.strip()}
 
 _cors_origins = [x.strip() for x in os.environ.get("CORS_ORIGINS", "").split(",") if x.strip()]
